@@ -1,0 +1,30 @@
+xgb:
+  threshold: 0.6
+  candle_limit: 1000
+
+lstm:
+  threshold: 0.7
+  candle_limit: 3000
+
+rl:
+  candle_limit: 600
+  reward_mode: pnl_gain
+
+data_fetcher:
+  max_candles: 4000
+
+strategy:
+  name: rsi_macd
+  timeframe: 1h
+  min_p_buy: 0.25
+  confidence_threshold: 0.70
+  allowed_side: [buy, sell]
+  use_trend_filter: true
+  dynamic_sl_tp: true
+  sl: 2.5
+  tp: 5.0
+  trailing:
+    enabled: true
+    type: pnl
+    trigger_pct: 1.5
+    trail_pct: 0.4
