@@ -1,0 +1,7 @@
+xgboost
+tensorflow
+discord.py
+streamlit
+flask
+pyyaml
+joblib
