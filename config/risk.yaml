@@ -1,0 +1,363 @@
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+from utils.log_manager import LogManager
+from utils.config_loader import ConfigLoader
+from strategies.strategy_engine import TradingOrder
+
+try:
+    from utils.discord_alert import send_discord_alert
+except ImportError:
+    send_discord_alert = None
+
+class RiskController:
+    def __init__(self):
+        self.logger = LogManager().get_logger("risk")
+        self.config = ConfigLoader()
+        self.risk_config = self.config.get_risk_config()
+        self.safe_mode_cfg = self.risk_config.get('safe_mode', {})
+        self.limits = self.risk_config.get('limits', {})
+        self.sl_tp = self.risk_config.get('sl_tp', {})
+        self.drawdown_cfg = self.risk_config.get('drawdown', {})
+        self.market_filters = self.risk_config.get('market_filters', {})
+        self.position_sizing = self.risk_config.get('position_sizing', {})
+        self.emergency_cfg = self.risk_config.get('emergency', {})
+        self.monitoring_cfg = self.risk_config.get('monitoring', {})
+
+        self.safe_mode_active = False
+        self.safe_mode_reason = None
+        self.safe_mode_activation_time = None
+        self.daily_stats = self._init_daily_stats()
+        self.hourly_trade_counts = {}
+        self.portfolio_value = 10000.0  # Should load from persistent state
+        self.daily_pnl = 0.0
+        self.max_drawdown = 0.0
+        self.peak_value = self.portfolio_value
+        self.trigger_flags = {k: False for k in self.safe_mode_cfg.get("triggers", [])}
+        self.last_trade_time = None
+
+    def _init_daily_stats(self) -> Dict:
+        return {
+            'date': datetime.utcnow().date(),
+            'trades_count': 0,
+            'pnl': 0.0,
+            'largest_loss': 0.0,
+            'largest_gain': 0.0,
+            'risk_events': [],
+            'consecutive_loss': 0
+        }
+
+    def _in_blackout(self) -> bool:
+        """Check if current time is in blackout period (major news, weekend gaps, low liquidity, etc.)"""
+        blackout = self.market_filters.get('blackout', {})
+        now = datetime.utcnow()
+        weekday = now.weekday()
+        hour = now.hour
+
+        if blackout.get('weekend_gaps', False) and weekday in [5, 6]:
+            self.logger.warning("⏰ Blackout: Weekend gaps")
+            return True
+        if blackout.get('low_liquidity_hours', False):
+            if hour < 7 or hour > 20:
+                self.logger.warning("⏰ Blackout: Low liquidity hours")
+                return True
+        # Add more blackout logic for major_news, fomc_meetings, etc.
+        return False
+
+    def _check_market_filters(self, symbol: str, market_data: Dict) -> bool:
+        """Check if order passes market filters (volatility, volume, spread)"""
+        min_vol = self.market_filters.get("min_volatility", 0.008)
+        max_vol = self.market_filters.get("max_volatility", 0.06)
+        min_vol24h = self.market_filters.get("min_volume", 15000000)
+        max_spread = self.market_filters.get("max_spread", 0.002)
+        vol = market_data.get('volatility', 0.01)
+        volume = market_data.get('volume', 0)
+        spread = market_data.get('spread', 0.0)
+        if not (min_vol <= vol <= max_vol):
+            self.logger.info(f"⛔ {symbol} filtered by volatility: {vol}")
+            return False
+        if volume < min_vol24h:
+            self.logger.info(f"⛔ {symbol} filtered by volume: {volume}")
+            return False
+        if spread > max_spread:
+            self.logger.info(f"⛔ {symbol} filtered by spread: {spread}")
+            return False
+        return True
+
+    def _apply_sl_tp(self, order: TradingOrder, atr: float = None):
+        """Apply stop loss/take profit dynamically per config"""
+        default_sl = self.sl_tp.get("default_sl", 1.8) / 100
+        default_tp = self.sl_tp.get("default_tp", 5.4) / 100
+        if self.sl_tp.get('volatility_adjustment', False) and atr:
+            order.stop_loss = max(default_sl, atr * self.sl_tp.get("atr_multiplier_sl", 1.5))
+            order.take_profit = max(default_tp, atr * self.sl_tp.get("atr_multiplier_tp", 4.5))
+        else:
+            order.stop_loss = default_sl
+            order.take_profit = default_tp
+        # Trailing stop
+        if self.sl_tp.get("trailing_enabled", False):
+            order.trailing = {
+                "trigger_pct": self.sl_tp.get("trailing_trigger", 2.0),
+                "distance_pct": self.sl_tp.get("trailing_distance", 0.6)
+            }
+
+    def _kelly_size(self, capital: float, win_rate: float, rrr: float, fraction: float = None) -> float:
+        """Calculate Kelly sizing per config"""
+        f = self.position_sizing.get("kelly_fraction", 0.12) if fraction is None else fraction
+        kelly = ((win_rate * (rrr + 1) - 1) / rrr) * f
+        max_kelly = self.position_sizing.get("max_kelly", 0.25)
+        min_position = self.position_sizing.get("min_position", 0.5) / 100
+        kelly = max(min(kelly, max_kelly), min_position)
+        return capital * kelly
+
+    async def validate_orders(self, orders: List[TradingOrder], market_datas: Optional[Dict[str, Dict]] = None) -> List[TradingOrder]:
+        """Validate and filter orders with all risk layers. market_datas: symbol -> dict for filters"""
+        if not orders:
+            return []
+        try:
+            # Blackout period
+            if self._in_blackout():
+                self.logger.warning("🛑 Blocked: Trading blackout period")
+                return []
+
+            if await self._check_safe_mode():
+                self.logger.warning("🛡️ Safe mode active - blocking all orders")
+                return []
+
+            validated_orders = []
+            for order in orders:
+                market_data = market_datas.get(order.symbol, {}) if market_datas else {}
+                if not self._check_market_filters(order.symbol, market_data):
+                    continue
+                if not await self._validate_single_order(order):
+                    continue
+                self._apply_sl_tp(order, atr=market_data.get('atr'))
+                validated_orders.append(order)
+
+            final_orders = await self._validate_portfolio_risk(validated_orders)
+            self.logger.info(f"✅ Risk validation: {len(final_orders)}/{len(orders)} orders approved")
+            return final_orders
+
+        except Exception as e:
+            self.logger.error(f"❌ Risk validation failed: {e}")
+            return []
+
+    async def _validate_single_order(self, order: TradingOrder) -> bool:
+        try:
+            max_trade_size = self.limits.get('max_trade_size', 1000)
+            min_trade_size = self.limits.get('min_trade_size', 10)
+            if not (min_trade_size <= order.quantity <= max_trade_size):
+                self.logger.info(f"⛔ {order.symbol}: size {order.quantity} out of range")
+                return False
+
+            # Daily trade limits
+            if self.daily_stats['trades_count'] >= self.limits.get('max_trades_per_day', 50):
+                self.logger.info("⛔ Daily trade limit reached")
+                return False
+
+            # Hourly trade limits
+            current_hour = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+            self.hourly_trade_counts.setdefault(current_hour, 0)
+            if self.hourly_trade_counts[current_hour] >= self.limits.get('max_trades_per_hour', 10):
+                self.logger.info("⛔ Hourly trade limit reached")
+                return False
+            self.hourly_trade_counts[current_hour] += 1
+            # Clean up old counts
+            self.hourly_trade_counts = {k: v for k, v in self.hourly_trade_counts.items() if k >= datetime.utcnow() - timedelta(hours=2)}
+
+            # Confidence threshold
+            min_conf = self.position_sizing.get('min_confidence_size', 0.6)
+            if order.confidence < min_conf:
+                self.logger.info(f"⛔ {order.symbol}: confidence {order.confidence:.2f} < {min_conf}")
+                return False
+
+            # Time between trades
+            min_time = self.limits.get('min_time_between_trades', 0)
+            now = datetime.utcnow()
+            if self.last_trade_time and (now - self.last_trade_time).total_seconds() < min_time * 60:
+                self.logger.info(f"⛔ Blocked by min_time_between_trades: {min_time} minutes")
+                return False
+            self.last_trade_time = now
+
+            return True
+        except Exception as e:
+            self.logger.error(f"❌ Error in single order validation: {e}")
+            return False
+
+    async def _validate_portfolio_risk(self, orders: List[TradingOrder]) -> List[TradingOrder]:
+        try:
+            if not orders:
+                return orders
+            # Portfolio exposure
+            total_exposure = sum(order.quantity for order in orders)
+            max_portfolio_risk = self.limits.get('max_portfolio_risk', 5.0) / 100
+            max_exposure = self.portfolio_value * max_portfolio_risk
+            if total_exposure > max_exposure:
+                scale = max_exposure / total_exposure
+                for order in orders:
+                    order.quantity *= scale
+                self.logger.warning(f"⚠️ Orders scaled by {scale:.2f} due to portfolio risk")
+
+            # Per-position size
+            max_position_size = self.limits.get('max_position_size', 10.0) / 100
+            max_position_value = self.portfolio_value * max_position_size
+            validated_orders = []
+            for order in orders:
+                if order.quantity > max_position_value:
+                    order.quantity = max_position_value
+                    self.logger.warning(f"⚠️ {order.symbol} size reduced to {max_position_value:.2f} for position limit")
+                validated_orders.append(order)
+
+            # Max concurrent positions
+            max_positions = self.limits.get('max_positions', 5)
+            unique_symbols = list({o.symbol: o for o in validated_orders}.values())
+            if len(unique_symbols) > max_positions:
+                validated_orders = sorted(validated_orders, key=lambda x: x.confidence, reverse=True)
+                symbol_count = {}
+                final_orders = []
+                for order in validated_orders:
+                    if order.symbol not in symbol_count and len(symbol_count) < max_positions:
+                        symbol_count[order.symbol] = 1
+                        final_orders.append(order)
+                validated_orders = final_orders
+
+            return validated_orders
+        except Exception as e:
+            self.logger.error(f"❌ Error in portfolio risk validation: {e}")
+            return orders
+
+    async def _check_safe_mode(self) -> bool:
+        try:
+            if not self.safe_mode_cfg.get('enable_safe_mode', True):
+                return False
+            # Auto-disable after N minutes
+            if self.safe_mode_active and self.safe_mode_activation_time:
+                disable_after = self.safe_mode_cfg.get('disable_after_minutes', 60)
+                if datetime.utcnow() > self.safe_mode_activation_time + timedelta(minutes=disable_after):
+                    await self.deactivate_safe_mode()
+                    return False
+            # Check triggers
+            triggers = self.safe_mode_cfg.get('triggers', [])
+            for trigger in triggers:
+                if await self._check_trigger_condition(trigger):
+                    await self.activate_safe_mode(trigger)
+                    return True
+            return self.safe_mode_active
+        except Exception as e:
+            self.logger.error(f"❌ Error checking safe mode: {e}")
+            return True
+
+    async def _check_trigger_condition(self, trigger: str) -> bool:
+        try:
+            if trigger == 'continuous_loss':
+                if self.daily_stats['consecutive_loss'] >= 3:
+                    return True
+            if trigger == 'insufficient_balance':
+                if self.portfolio_value < 1000:
+                    return True
+            if trigger in self.trigger_flags and self.trigger_flags[trigger]:
+                return True
+            if trigger == 'daily_loss':
+                max_daily_loss = self.limits.get('max_daily_loss', 3.0) / 100
+                if self.daily_pnl < -self.portfolio_value * max_daily_loss:
+                    return True
+            if trigger == 'high_drawdown':
+                limit = self.drawdown_cfg.get('max_drawdown', 8.0) / 100
+                drawdown = (self.peak_value - self.portfolio_value) / self.peak_value
+                if drawdown > limit:
+                    return True
+            # Add more triggers as needed
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ Error checking trigger {trigger}: {e}")
+            return False
+
+    async def activate_safe_mode(self, reason: str):
+        try:
+            if not self.safe_mode_active:
+                self.safe_mode_active = True
+                self.safe_mode_reason = reason
+                self.safe_mode_activation_time = datetime.utcnow()
+                self.logger.warning(f"🛡️ Safe mode activated: {reason}")
+                self.daily_stats['risk_events'].append({
+                    'type': 'safe_mode_activation',
+                    'reason': reason,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                if send_discord_alert and self.config.get("discord.safe_mode_alert", True):
+                    await send_discord_alert(f"🛡️ SAFE MODE ACTIVATED - Reason: {reason}")
+        except Exception as e:
+            self.logger.error(f"❌ Error activating safe mode: {e}")
+
+    async def deactivate_safe_mode(self):
+        try:
+            if self.safe_mode_active:
+                duration = (datetime.utcnow() - self.safe_mode_activation_time).total_seconds() / 60
+                self.logger.info(f"✅ Safe mode deactivated after {duration:.1f} minutes")
+                self.safe_mode_active = False
+                self.safe_mode_reason = None
+                self.safe_mode_activation_time = None
+        except Exception as e:
+            self.logger.error(f"❌ Error deactivating safe mode: {e}")
+
+    async def update_daily_stats(self, trade_pnl: float):
+        try:
+            current_date = datetime.utcnow().date()
+            if current_date != self.daily_stats['date']:
+                self.daily_stats = self._init_daily_stats()
+                self.daily_pnl = 0.0
+            self.daily_stats['trades_count'] += 1
+            self.daily_stats['pnl'] += trade_pnl
+            self.daily_pnl += trade_pnl
+            if trade_pnl > self.daily_stats['largest_gain']:
+                self.daily_stats['largest_gain'] = trade_pnl
+            if trade_pnl < self.daily_stats['largest_loss']:
+                self.daily_stats['largest_loss'] = trade_pnl
+            if trade_pnl < 0:
+                self.daily_stats['consecutive_loss'] += 1
+            else:
+                self.daily_stats['consecutive_loss'] = 0
+            if self.daily_stats['consecutive_loss'] >= 3:
+                await self.activate_safe_mode("consecutive_loss")
+            self.portfolio_value += trade_pnl
+            if self.portfolio_value > self.peak_value:
+                self.peak_value = self.portfolio_value
+            else:
+                drawdown = (self.peak_value - self.portfolio_value) / self.peak_value
+                if drawdown > self.max_drawdown:
+                    self.max_drawdown = drawdown
+        except Exception as e:
+            self.logger.error(f"❌ Error updating daily stats: {e}")
+
+    def get_risk_status(self) -> Dict:
+        try:
+            drawdown = (self.peak_value - self.portfolio_value) / self.peak_value if self.peak_value else 0
+            return {
+                'safe_mode_active': self.safe_mode_active,
+                'safe_mode_reason': self.safe_mode_reason,
+                'portfolio_value': self.portfolio_value,
+                'daily_pnl': self.daily_pnl,
+                'daily_trades': self.daily_stats['trades_count'],
+                'max_drawdown': drawdown,
+                'risk_limits': {
+                    'max_daily_loss': self.limits.get('max_daily_loss', 3.0),
+                    'max_position_size': self.limits.get('max_position_size', 10.0),
+                    'max_trades_per_day': self.limits.get('max_trades_per_day', 50)
+                }
+            }
+        except Exception as e:
+            self.logger.error(f"❌ Error getting risk status: {e}")
+            return {'error': str(e)}
+
+    async def emergency_stop(self):
+        try:
+            await self.activate_safe_mode("emergency_stop")
+            self.logger.critical("🚨 EMERGENCY STOP - All trading halted")
+        except Exception as e:
+            self.logger.error(f"❌ Error in emergency stop: {e}")
