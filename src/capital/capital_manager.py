@@ -12,8 +12,11 @@ class CapitalManager:
         self.logger = LogManager.get_logger("capital")
         self.reset_state()
 
-        cfg = self.config.get("risk", reload=True)
-        self.max_position_pct = cfg.get("risk_control", {}).get("max_position_size", 10.0) / 100.0
+        cfg = self.config.get("strategy", reload=True)
+
+        # Đọc thông số từ strategy.yaml
+        self.max_position_pct = cfg.get("strategy", {}).get("max_position_size", 4.0) / 100.0
+        self.kelly_fraction = cfg.get("strategy", {}).get("kelly_fraction", 0.12)
 
     def reset_state(self):
         self.balance = 10000.0  # Khởi tạo giả định, cần lấy từ API thực tế
@@ -32,28 +35,36 @@ class CapitalManager:
         self.total_pnl += realized_pnl
         self.logger.info(f"Balance updated: {self.balance:.2f}, Daily PnL: {self.daily_pnl:.2f}")
 
-    def kelly_position_size(self, winrate, rr, risk_pct=0.01):
+    def kelly_position_size(self, winrate, rr, risk_pct=None):
         """
         Tính position size theo Kelly Criterion:
         Kelly = W - (1-W)/R, W: winrate, R: reward/risk
         """
+        fraction = self.kelly_fraction
         kelly = winrate - (1 - winrate) / rr if rr > 0 else 0
         kelly = max(0, min(kelly, 1))  # Clamp 0-1
+        risk_pct = fraction if risk_pct is None else risk_pct
         size = self.balance * min(kelly * risk_pct, self.max_position_pct)
         self.logger.debug(f"Kelly size: {size:.2f} ({kelly=:.2f}, {risk_pct=:.2f})")
         return round(size, 2)
 
-    def fixed_position_size(self, risk_pct=0.01):
+    def fixed_position_size(self, risk_pct=None):
+        risk_pct = risk_pct if risk_pct is not None else self.kelly_fraction
         size = self.balance * min(risk_pct, self.max_position_pct)
         self.logger.debug(f"Fixed size: {size:.2f} ({risk_pct=:.2f})")
         return round(size, 2)
 
-    def get_position_size(self, strategy_stats, method="kelly", risk_pct=0.01):
+    def get_position_size(self, strategy_stats, method=None, risk_pct=None):
         """
         strategy_stats: dict with keys 'winrate', 'rr'
         """
+        method = method or self.config.get("strategy", {}).get("strategy", {}).get("position_sizing_method", "kelly")
         if method == "kelly":
-            return self.kelly_position_size(strategy_stats.get("winrate", 0.55), strategy_stats.get("rr", 2.0), risk_pct)
+            return self.kelly_position_size(
+                strategy_stats.get("winrate", 0.55),
+                strategy_stats.get("rr", 2.0),
+                risk_pct if risk_pct is not None else self.kelly_fraction
+            )
         else:
             return self.fixed_position_size(risk_pct)
 
@@ -91,7 +102,7 @@ class CapitalManager:
 if __name__ == "__main__":
     cm = CapitalManager()
     stats = {"winrate": 0.60, "rr": 2.0}
-    size = cm.get_position_size(stats, method="kelly", risk_pct=0.02)
+    size = cm.get_position_size(stats)
     cm.add_position("BTCUSDT", size, 29000, "buy")
     pnl = cm.close_position(0, 29200)
     print("PnL Closed:", pnl)
