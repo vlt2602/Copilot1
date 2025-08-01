@@ -2,8 +2,8 @@ import threading
 from collections import deque
 from datetime import datetime
 from typing import Dict, Deque, Any
-from utils.config_loader import ConfigLoader
-from utils.log_manager import LogManager
+from src.utils.config_loader import ConfigLoader
+from src.utils.log_manager import LogManager
 
 class CandleBuffer:
     """
