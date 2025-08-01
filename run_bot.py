@@ -1,15 +1,15 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from pipeline.data_pipeline import DataPipeline
-from capital.capital_manager import CapitalManager
-from ai.ai_engine import AIEngine
-from strategy.strategy_engine import StrategyEngine
-from risk.risk_controller import RiskController
-from execution.execution_engine import ExecutionEngine
-from discord.discord_bot import DiscordBot
-from webhook.webhook_server import WebhookQueue, WebhookServer
-from safemode.safemode_system import SafeModeSystem
+from src.pipeline.data_pipeline import DataPipeline
+from src.capital.capital_manager import CapitalManager
+from src.ai.ai_engine import AIEngine
+from src.strategy.strategy_engine import StrategyEngine
+from src.risk.risk_controller import RiskController
+from src.execution.execution_engine import ExecutionEngine
+from src.discord.discord_bot import DiscordBot
+from src.webhook.webhook_server import WebhookQueue, WebhookServer
+from src.safemode.safemode_system import SafeModeSystem
 
 def on_new_candle(symbol, timeframe, candles):
     ai_signal = ai_engine.ensemble_predict(symbol, extract_features(candles), extract_series(candles), extract_state(candles))
