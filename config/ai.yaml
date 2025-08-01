@@ -1,0 +1,130 @@
+# THopper PRO++ AI Model Configuration - Production Optimized
+
+# XGBoost Configuration (Primary model - most reliable)
+xgb:
+  threshold: 0.78  # Higher threshold for profitability
+  candle_limit: 800  # Railway memory optimization
+  model_params:
+    n_estimators: 80  # Reduced for speed/memory
+    max_depth: 5  # Prevent overfitting
+    learning_rate: 0.12
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+    early_stopping_rounds: 10
+  features:
+    - rsi
+    - macd
+    - bb_upper
+    - bb_lower
+    - volume_sma
+    - price_change
+    - volatility
+    - trend_strength
+  timeframe: 1h
+  update_frequency: 72  # Hours between updates
+
+# LSTM Configuration (Disabled for Railway cost efficiency)
+lstm:
+  enabled: false  # Disable to save resources
+  threshold: 0.75
+  candle_limit: 500
+  fallback_mode: moving_average
+  timeframe: 4h  # Less frequent updates
+
+# Reinforcement Learning Configuration (Adaptive intelligence)
+rl:
+  enabled: true
+  threshold: 0.65  # Lower as it's adaptive
+  candle_limit: 400  # Memory optimization
+  reward_mode: risk_adjusted_return
+  model_params:
+    learning_rate: 0.0008  # Slower learning for stability
+    discount_factor: 0.96
+    epsilon_start: 0.3  # Less exploration in production
+    epsilon_end: 0.05
+    epsilon_decay: 0.998
+    memory_size: 2000  # Reduced memory usage
+    batch_size: 32
+    update_frequency: 6
+  state_features:
+    - price_normalized
+    - volume_normalized
+    - rsi
+    - macd_signal
+    - position_pnl
+    - market_regime
+  actions: [hold, buy, sell]
+  timeframe: 2h  # Less frequent for stability
+
+# General AI Settings (Optimized for 5 goals)
+general:
+  retrain_interval: 168  # Weekly retraining for stability
+  min_training_samples: 300  # Reduced for Railway
+  validation_split: 0.25
+  early_stopping_patience: 8
+  model_save_interval: 12
+  
+  # Ensemble Settings (Intelligence + Safety)
+  ensemble:
+    enabled: true
+    weights:
+      xgb: 0.6  # Primary model
+      lstm: 0.1  # Minimal weight when disabled
+      rl: 0.3   # Adaptive component
+    min_agreement: 0.70  # Higher for safety
+    confidence_boost: 0.05  # Bonus for agreement
+
+# Training Configuration (Long-term stability)
+training:
+  auto_retrain: true
+  retrain_schedule: weekly  # Consistent schedule
+  retrain_triggers:
+    - accuracy_below: 0.62  # Higher threshold
+    - days_since_training: 14  # Max staleness
+    - market_regime_change: true
+    - drawdown_above: 0.08
+  
+  data_preprocessing:
+    normalize: true
+    handle_missing: interpolate
+    outlier_removal: iqr
+    feature_scaling: robust
+    
+  validation:
+    method: walk_forward
+    test_size: 0.2
+    n_splits: 3  # Reduced for speed
+
+# Performance Monitoring (Profitability focus)
+monitoring:
+  track_accuracy: true
+  track_precision: true
+  track_recall: true
+  track_f1_score: true
+  track_sharpe_ratio: true
+  track_profit_factor: true
+  track_win_rate: true
+  alert_threshold: 0.58  # Aggressive performance monitoring
+  
+  # Performance-based model switching
+  disable_model_below_accuracy: 0.55
+  boost_model_above_accuracy: 0.70
+  adaptive_thresholds: true
+
+# Cost Optimization (Railway efficiency)
+resource_limits:
+  max_memory_mb: 400
+  max_cpu_percent: 80
+  training_timeout: 300  # 5 minutes max
+  prediction_timeout: 5   # Fast predictions
+  batch_processing: true
+  
+# Intelligence Optimization  
+intelligence:
+  adaptive_thresholds: true
+  market_regime_detection: true
+  volatility_adjustment: true
+  trend_following_boost: 0.1
+  mean_reversion_boost: 0.05
+  mean_reversion_boost: 0.05
