@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from pipeline.data_pipeline import DataPipeline
 from capital.capital_manager import CapitalManager
 from ai.ai_engine import AIEngine
