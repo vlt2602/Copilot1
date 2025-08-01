@@ -1,8 +1,10 @@
+import os
 import discord
 from discord.ext import commands
 import asyncio
 from utils.config_loader import ConfigLoader
 from utils.log_manager import LogManager
+from dotenv import load_dotenv  # Thêm dòng này để hỗ trợ .env
 
 class DiscordBot(commands.Bot):
     """
@@ -18,7 +20,10 @@ class DiscordBot(commands.Bot):
         self.capital_manager = capital_manager
         self.risk_controller = risk_controller
         self.execution_engine = execution_engine
-        self.channel_id = int(self.config.get("discord", reload=True).get("channel_id", 0))
+
+        # Load .env và lấy channel_id từ biến môi trường
+        load_dotenv()
+        self.channel_id = int(os.getenv("DISCORD_CHANNEL_ID", 0))
         self.add_commands()
 
     def add_commands(self):
@@ -94,10 +99,14 @@ if __name__ == "__main__":
         def create_order(self, **kwargs): return {**kwargs, "id": 123}
         def update_stop_loss(self, order_id, sl): pass
 
+    load_dotenv()  # Đảm bảo load .env cho đoạn main này
+
     cm = CapitalManager()
     rc = RiskController()
     ee = ExecutionEngine(DummyClient(), cm, rc)
-    bot_token = ConfigLoader().get("discord", reload=True).get("token")
+
+    # Lấy token từ .env thay vì từ config
+    bot_token = os.getenv("DISCORD_TOKEN")
     bot = DiscordBot(cm, rc, ee)
     print("Discord bot running... Use !status, !order, !safemode, !closeall")
     bot.run(bot_token)
